@@ -1,0 +1,23 @@
+.header {
+  background-color: #282c34;
+  padding: 2rem 0;
+  color: white;
+}
+
+.header-content {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 2rem;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 2.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.header p {
+  margin: 0;
+  font-size: 1.2rem;
+  opacity: 0.8;
+} 
