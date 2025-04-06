@@ -1,5 +1,5 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import io from 'socket.io-client';
+import React, { createContext, useContext, useEffect, useState } from 'react';
+import { io } from 'socket.io-client';
 
 const SocketContext = createContext();
 
@@ -7,44 +7,56 @@ export const useSocket = () => useContext(SocketContext);
 
 export const SocketProvider = ({ children }) => {
   const [socket, setSocket] = useState(null);
-  const [connected, setConnected] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
-    // Connect to the socket server
-    const newSocket = io('http://192.168.18.27:3001', {
-      transports: ['websocket'],
-      autoConnect: false
+    console.log('Initializing socket connection...');
+    
+    const socketInstance = io('http://192.168.18.27:3001', {
+      reconnection: true,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 20000,
+      transports: ['websocket', 'polling']
     });
 
-    // Set up event listeners
-    newSocket.on('connect', () => {
-      console.log('Socket connected');
-      setConnected(true);
+    socketInstance.on('connect', () => {
+      console.log('Socket connected successfully');
+      console.log('Socket ID:', socketInstance.id);
+      setIsConnected(true);
     });
 
-    newSocket.on('disconnect', () => {
+    socketInstance.on('disconnect', () => {
       console.log('Socket disconnected');
-      setConnected(false);
+      setIsConnected(false);
     });
 
-    newSocket.on('error', (error) => {
+    socketInstance.on('connect_error', (error) => {
+      console.error('Socket connection error:', error);
+      console.error('Connection details:', {
+        url: 'http://192.168.18.27:3001',
+        transport: socketInstance.io.engine.transport.name
+      });
+      setIsConnected(false);
+    });
+
+    socketInstance.on('error', (error) => {
       console.error('Socket error:', error);
     });
 
-    // Connect the socket
-    newSocket.connect();
+    setSocket(socketInstance);
 
-    // Store the socket in state
-    setSocket(newSocket);
-
-    // Clean up on unmount
     return () => {
-      newSocket.disconnect();
+      console.log('Cleaning up socket connection...');
+      if (socketInstance) {
+        socketInstance.disconnect();
+      }
     };
   }, []);
 
   return (
-    <SocketContext.Provider value={{ socket, connected }}>
+    <SocketContext.Provider value={{ socket, connected: isConnected }}>
       {children}
     </SocketContext.Provider>
   );

@@ -14,7 +14,7 @@ const server = http.createServer(app);
 // Create Socket.io server
 const io = new Server(server, {
   cors: {
-    origin: 'http://localhost:3000',
+    origin: '*', // Allow all origins in development
     methods: ['GET', 'POST']
   }
 });
@@ -76,6 +76,7 @@ const createGame = (roomId) => {
   const game = {
     id: roomId,
     players: [],
+    waitingPlayers: [],
     dealer: { cards: [], score: 0 },
     deck: createDeck(),
     gamePhase: 'waiting', // waiting, betting, playing, dealerTurn, gameOver
@@ -156,6 +157,7 @@ const determineWinners = (game) => {
   
   console.log(`Determining winners. Dealer score: ${dealerScore}${dealerBust ? ' (BUST)' : ''}`);
   
+  let winners = [];
   for (const player of game.players) {
     if (player.status === 'playing' || player.status === 'stand') {
       const playerScore = player.score;
@@ -170,10 +172,12 @@ const determineWinners = (game) => {
       } else if (dealerBust) {
         player.status = 'win';
         player.chips += player.bet;
+        winners.push(player.name);
         console.log(`${player.name} wins ${player.bet} chips. Remaining chips: ${player.chips}`);
       } else if (playerScore > dealerScore) {
         player.status = 'win';
         player.chips += player.bet;
+        winners.push(player.name);
         console.log(`${player.name} wins ${player.bet} chips. Remaining chips: ${player.chips}`);
       } else if (playerScore < dealerScore) {
         player.status = 'lose';
@@ -181,40 +185,57 @@ const determineWinners = (game) => {
         console.log(`${player.name} loses ${player.bet} chips. Remaining chips: ${player.chips}`);
       } else {
         player.status = 'push';
-        // Return bet to player (no change in chips)
+        winners.push(player.name);
         console.log(`${player.name} pushes. Bet returned. Chips: ${player.chips}`);
       }
     }
   }
   
   game.gamePhase = 'gameOver';
-  game.message = 'Game over!';
-  
-  // Broadcast the game over state with updated chips
+  game.winners = winners;
+  game.resetTimer = 15;
+  game.message = winners.length > 0 
+    ? `Congratulations ${winners.join(', ')}! 🎉`
+    : 'Game over! Better luck next time!';
+
+  // Broadcast the game over state
   io.to(game.id).emit('gameStateUpdate', { gameState: game });
-  
-  // Auto-reset the game after 5 seconds
-  setTimeout(() => {
-    resetGame(game);
+
+  // Start the reset timer
+  game.resetTimerId = setInterval(() => {
+    game.resetTimer--;
     io.to(game.id).emit('gameStateUpdate', { gameState: game });
-    console.log(`Game ${game.id} auto-reset after game over`);
-  }, 5000);
-  
-  return game;
+    
+    if (game.resetTimer <= 0) {
+      clearInterval(game.resetTimerId);
+      if (game.gamePhase === 'gameOver') {
+        console.log('Game auto-resetting after 15 second timeout');
+        resetGame(game);
+        io.to(game.id).emit('gameStateUpdate', { gameState: game });
+      }
+    }
+  }, 1000);
 };
 
 const resetGame = (game) => {
   console.log(`Resetting game ${game.id}`);
   
-  // Preserve player chips but reset everything else
-  game.players = game.players.map(player => ({
-    ...player,
-    cards: [],
-    score: 0,
-    bet: 0,
-    status: 'waiting',
-    isCurrentPlayer: false
-  }));
+  // Move waiting players to active players
+  game.players = [
+    ...game.players.map(player => ({
+      ...player,
+      cards: [],
+      score: 0,
+      bet: 0,
+      status: 'waiting',
+      isCurrentPlayer: false
+    })),
+    ...game.waitingPlayers.map(player => ({
+      ...player,
+      status: 'waiting'
+    }))
+  ];
+  game.waitingPlayers = [];
   
   game.dealer = { cards: [], score: 0 };
   game.deck = createDeck();
@@ -244,14 +265,49 @@ io.on('connection', (socket) => {
   
   // Join a game room
   socket.on('joinGame', ({ playerName, roomId }) => {
-    // Generate a room ID if not provided
-    const gameId = roomId || uuidv4();
+    const game = getGame('room1'); // Always use room1
+    const existingPlayer = game.players.find(p => p.name === playerName);
+    const waitingPlayer = game.waitingPlayers.find(p => p.name === playerName);
     
-    // Get or create the game
-    const game = getGame(gameId);
-    
-    // Create player
-    const player = {
+    if (existingPlayer) {
+      // Reconnecting player
+      existingPlayer.id = socket.id;
+      socket.join('room1');
+      socket.emit('playerJoined', { 
+        player: existingPlayer,
+        gameState: game
+      });
+      io.to('room1').emit('gameStateUpdate', { gameState: game });
+      return;
+    }
+
+    if (waitingPlayer) {
+      // Move from waiting to active if game is in waiting phase
+      if (game.gamePhase === 'waiting') {
+        waitingPlayer.id = socket.id;
+        game.players.push(waitingPlayer);
+        game.waitingPlayers = game.waitingPlayers.filter(p => p.name !== playerName);
+        socket.join('room1');
+        socket.emit('playerJoined', {
+          player: waitingPlayer,
+          gameState: game
+        });
+        io.to('room1').emit('gameStateUpdate', { gameState: game });
+      } else {
+        // Update socket ID for waiting player
+        waitingPlayer.id = socket.id;
+        socket.join('room1');
+        socket.emit('playerJoined', {
+          player: waitingPlayer,
+          gameState: game,
+          isWaiting: true
+        });
+      }
+      return;
+    }
+
+    // New player
+    const newPlayer = {
       id: socket.id,
       name: playerName,
       chips: 1000,
@@ -261,35 +317,25 @@ io.on('connection', (socket) => {
       status: 'waiting',
       isCurrentPlayer: false
     };
-    
-    // Add player to game
-    game.players.push(player);
-    
-    // Join the socket room
-    socket.join(gameId);
-    
-    // Notify the player they joined
-    socket.emit('playerJoined', { 
-      player,
-      gameState: game
-    });
-    
-    // Notify other players
-    socket.to(gameId).emit('playerJoined', { 
-      player: { ...player, isCurrentPlayer: false },
-      gameState: game
-    });
-    
-    // If this is the first player, make them the dealer
-    if (game.players.length === 1) {
-      player.isDealer = true;
-      game.message = `${playerName} joined as dealer. Waiting for more players...`;
+
+    if (game.gamePhase === 'waiting') {
+      game.players.push(newPlayer);
     } else {
-      game.message = `${playerName} joined the game.`;
+      game.waitingPlayers.push(newPlayer);
+      socket.emit('playerJoined', {
+        player: newPlayer,
+        gameState: game,
+        isWaiting: true
+      });
+      return;
     }
-    
-    // Broadcast updated game state
-    io.to(gameId).emit('gameStateUpdate', { gameState: game });
+
+    socket.join('room1');
+    socket.emit('playerJoined', {
+      player: newPlayer,
+      gameState: game
+    });
+    io.to('room1').emit('gameStateUpdate', { gameState: game });
   });
   
   // Player ready to start
@@ -513,10 +559,24 @@ io.on('connection', (socket) => {
       io.to(roomId).emit('gameStateUpdate', { gameState: game });
     }
   });
+
+  // Next game
+  socket.on('nextGame', () => {
+    const game = findGameByPlayerId(socket.id);
+    if (game && game.gamePhase === 'gameOver') {
+      console.log('Player requested next game');
+      clearInterval(game.resetTimerId); // Clear the auto-reset timer
+      resetGame(game);
+      io.to(game.id).emit('gameStateUpdate', { gameState: game });
+    }
+  });
 });
 
-// Start the server
+// Start server
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
+  console.log('Server is accessible on:');
+  console.log(`- Local: http://localhost:${PORT}`);
+  console.log(`- Network: http://0.0.0.0:${PORT}`);
 }); 

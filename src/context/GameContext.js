@@ -1,155 +1,198 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
-import { useSocket } from './SocketContext';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import io from 'socket.io-client';
 
 const GameContext = createContext();
 
-export const useGame = () => useContext(GameContext);
+export const useGame = () => {
+  const context = useContext(GameContext);
+  if (!context) {
+    throw new Error('useGame must be used within a GameProvider');
+  }
+  return context;
+};
 
 export const GameProvider = ({ children }) => {
-  const { socket, connected } = useSocket();
-  
-  // Game state
-  const [gameState, setGameState] = useState({
-    id: null,
-    players: [],
-    currentPlayer: null,
-    dealer: { cards: [], score: 0 },
-    deck: [],
-    gamePhase: 'waiting', // waiting, betting, playing, dealerTurn, gameOver
-    pot: 0,
-    currentBet: 0,
-    message: 'Waiting for players...'
-  });
-  
-  const [playerState, setPlayerState] = useState({
-    id: null,
-    name: '',
-    chips: 1000,
-    cards: [],
-    score: 0,
-    bet: 0,
-    status: 'waiting', // waiting, ready, playing, bust, stand
-    isDealer: false
-  });
+  const [socket, setSocket] = useState(null);
+  const [gameState, setGameState] = useState(null);
+  const [playerState, setPlayerState] = useState(null);
+  const [gameMessage, setGameMessage] = useState('');
+  const [error, setError] = useState(null);
+  const [currentRoom, setCurrentRoom] = useState(null);
+  const [isConnecting, setIsConnecting] = useState(false);
 
-  // Join a game room
-  const joinGame = (playerName, roomId) => {
-    if (socket && connected) {
-      socket.emit('joinGame', { playerName, roomId });
-    }
-  };
-
-  // Place a bet
-  const placeBet = (amount) => {
-    if (socket && connected && gameState.gamePhase === 'betting') {
-      console.log(`Placing bet of ${amount} in room ${gameState.id}`);
-      socket.emit('placeBet', { amount, roomId: gameState.id });
-    }
-  };
-
-  // Hit (take another card)
-  const hit = () => {
-    if (socket && connected && gameState.gamePhase === 'playing') {
-      socket.emit('hit', { roomId: gameState.id });
-    }
-  };
-
-  // Stand (end turn)
-  const stand = () => {
-    if (socket && connected && gameState.gamePhase === 'playing') {
-      socket.emit('stand', { roomId: gameState.id });
-    }
-  };
-
-  // Double down
-  const doubleDown = () => {
-    if (socket && connected && gameState.gamePhase === 'playing') {
-      socket.emit('doubleDown', { roomId: gameState.id });
-    }
-  };
-
-  // Listen for game updates
+  // Initialize socket connection
   useEffect(() => {
-    if (socket) {
-      // Player joined
-      socket.on('playerJoined', (data) => {
-        console.log('Player joined:', data);
-        setGameState(prev => ({
-          ...prev,
-          id: data.gameState.id,
-          ...data.gameState,
-          players: [...prev.players, data.player],
-          message: `${data.player.name} joined the game`
-        }));
+    if (!socket && !isConnecting) {
+      setIsConnecting(true);
+      const serverUrl = window.location.hostname === 'localhost' 
+        ? 'http://localhost:3001'
+        : `http://${window.location.hostname}:3001`;
         
-        // Update player state if this is the current player
-        if (data.player.id === socket.id) {
-          setPlayerState(data.player);
-        }
+      const newSocket = io(serverUrl, {
+        reconnection: true,
+        reconnectionAttempts: 5,
+        reconnectionDelay: 1000,
+        transports: ['websocket'],
+        timeout: 10000
       });
 
-      // Player left
-      socket.on('playerLeft', (data) => {
-        console.log('Player left:', data);
-        setGameState(prev => ({
-          ...prev,
-          ...data.gameState,
-          players: prev.players.filter(p => p.id !== data.playerId),
-          message: `${data.playerName} left the game`
-        }));
-      });
+      const handleConnect = () => {
+        console.log('Connected to game server with ID:', newSocket.id);
+        setSocket(newSocket);
+        setIsConnecting(false);
+        setError(null);
+      };
 
-      // Game state update
-      socket.on('gameStateUpdate', (data) => {
-        console.log('Game state update:', data.gameState);
-        setGameState(data.gameState);
-        
-        // Update player state if this player exists in the game
-        const currentPlayer = data.gameState.players.find(p => p.id === socket.id);
-        if (currentPlayer) {
-          setPlayerState(currentPlayer);
-        }
-      });
+      const handleDisconnect = () => {
+        console.log('Disconnected from game server');
+        setSocket(null);
+        setPlayerState(null);
+        setGameState(null);
+        setCurrentRoom(null);
+        setError('Disconnected from server. Please refresh the page.');
+        setIsConnecting(false);
+      };
 
-      // Player state update
-      socket.on('playerStateUpdate', (data) => {
-        console.log('Player state update:', data.playerState);
-        setPlayerState(data.playerState);
-      });
+      const handleConnectError = (error) => {
+        console.error('Connection error:', error);
+        setSocket(null);
+        setError('Failed to connect to server. Please check your connection.');
+        setIsConnecting(false);
+      };
 
-      // Game message
-      socket.on('gameMessage', (data) => {
-        console.log('Game message:', data.message);
-        setGameState(prev => ({
-          ...prev,
-          message: data.message
-        }));
-      });
+      newSocket.on('connect', handleConnect);
+      newSocket.on('disconnect', handleDisconnect);
+      newSocket.on('connect_error', handleConnectError);
+
+      return () => {
+        console.log('Cleaning up socket connection');
+        newSocket.removeListener('connect', handleConnect);
+        newSocket.removeListener('disconnect', handleDisconnect);
+        newSocket.removeListener('connect_error', handleConnectError);
+        newSocket.disconnect();
+      };
     }
+  }, []);
+
+  // Handle game events
+  useEffect(() => {
+    if (!socket) return;
+
+    const handleGameStateUpdate = ({ gameState }) => {
+      console.log('Game state update:', gameState);
+      setGameState(gameState);
+      setGameMessage(gameState.message || '');
+    };
+
+    const handlePlayerJoined = ({ player, gameState }) => {
+      console.log('Player joined:', player);
+      if (player.id === socket.id) {
+        setPlayerState(player);
+        setCurrentRoom(gameState.id);
+        setError(null);
+      }
+      setGameState(gameState);
+    };
+
+    const handleJoinError = (error) => {
+      console.error('Join error:', error);
+      setError(typeof error === 'string' ? error : error.message);
+      setPlayerState(null);
+      setCurrentRoom(null);
+    };
+
+    socket.on('gameStateUpdate', handleGameStateUpdate);
+    socket.on('playerJoined', handlePlayerJoined);
+    socket.on('joinError', handleJoinError);
+    socket.on('error', handleJoinError);
 
     return () => {
-      if (socket) {
-        socket.off('playerJoined');
-        socket.off('playerLeft');
-        socket.off('gameStateUpdate');
-        socket.off('playerStateUpdate');
-        socket.off('gameMessage');
-      }
+      socket.off('gameStateUpdate', handleGameStateUpdate);
+      socket.off('playerJoined', handlePlayerJoined);
+      socket.off('joinError', handleJoinError);
+      socket.off('error', handleJoinError);
     };
   }, [socket]);
 
-  return (
-    <GameContext.Provider value={{
-      gameState,
-      playerState,
-      socket,
-      joinGame,
-      placeBet,
-      hit,
-      stand,
-      doubleDown
-    }}>
-      {children}
-    </GameContext.Provider>
-  );
-}; 
+  const joinGame = useCallback((playerName, roomId) => {
+    if (!socket) {
+      setError('Not connected to server. Please refresh the page.');
+      return;
+    }
+
+    if (currentRoom) {
+      socket.emit('leaveGame', { roomId: currentRoom });
+    }
+
+    console.log('Joining game with name:', playerName, 'in room:', roomId);
+    socket.emit('joinGame', { playerName, roomId });
+  }, [socket, currentRoom]);
+
+  const readyToPlay = useCallback(() => {
+    if (socket && gameState) {
+      socket.emit('playerReady', { roomId: gameState.id });
+    }
+  }, [socket, gameState]);
+
+  const placeBet = useCallback((amount) => {
+    if (socket && gameState) {
+      socket.emit('placeBet', { amount, roomId: gameState.id });
+    }
+  }, [socket, gameState]);
+
+  const hit = useCallback(() => {
+    if (socket && gameState) {
+      socket.emit('hit', { roomId: gameState.id });
+    }
+  }, [socket, gameState]);
+
+  const stand = useCallback(() => {
+    if (socket && gameState) {
+      socket.emit('stand', { roomId: gameState.id });
+    }
+  }, [socket, gameState]);
+
+  const doubleDown = useCallback(() => {
+    if (socket && gameState && gameState.gamePhase === 'playing') {
+      socket.emit('doubleDown', { roomId: gameState.id });
+    }
+  }, [socket, gameState]);
+
+  const nextGame = useCallback(() => {
+    if (socket && gameState && gameState.gamePhase === 'gameOver') {
+      console.log('Starting next game');
+      socket.emit('nextGame', { roomId: gameState.id });
+    }
+  }, [socket, gameState]);
+
+  const leaveGame = useCallback(() => {
+    if (socket && currentRoom) {
+      socket.emit('leaveGame', { roomId: currentRoom });
+      setPlayerState(null);
+      setGameState(null);
+      setCurrentRoom(null);
+    }
+  }, [socket, currentRoom]);
+
+  const value = {
+    socket,
+    gameState,
+    playerState,
+    gameMessage,
+    error,
+    currentRoom,
+    isConnecting,
+    joinGame,
+    leaveGame,
+    placeBet,
+    readyToPlay,
+    hit,
+    stand,
+    doubleDown,
+    nextGame
+  };
+
+  return <GameContext.Provider value={value}>{children}</GameContext.Provider>;
+};
+
+export default GameContext; 
